@@ -1093,6 +1093,10 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     // MARK: Compose Service Level Functions
     private func configService(_ service: Service, serviceName: String, from dockerCompose: DockerCompose, launchState: LaunchState) async throws {
         try await waitForDependencyConditions(serviceName: serviceName, service: service, launchState: launchState)
+        // Snapshot the live env (seed .env + IPs recorded by earlier waves) once,
+        // so every arg built below interpolates against the same values.
+        let envSnapshot = await launchState.environmentSnapshot()
+
 
         var imageToRun: String
         
@@ -1106,7 +1110,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             // Interpolated: pinning an image per environment with
             // `image: repo/name:${TAG:-1.0}` is the common case, and container
             // rejects the raw form with "invalid format for image reference".
-            let resolvedImage = Self.resolvedImageReference(img, environment: environmentVariables)
+            let resolvedImage = Self.resolvedImageReference(img, environment: envSnapshot)
             try await pullImage(resolvedImage, platform: service.platform)
             imageToRun = resolvedImage
         } else {
@@ -1168,7 +1172,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             for: service,
             serviceName: serviceName,
             projectName: projectName,
-            environment: environmentVariables
+            environment: envSnapshot
         ))
 
         // REMOVED: Restart policy is not supported by `container run`
@@ -1194,7 +1198,6 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // Combine environment variables from .env files and service environment.
         // The base env is snapshotted from the actor so it includes the IP
         // substitutions recorded by services in earlier (already-completed) waves.
-        let envSnapshot = await launchState.environmentSnapshot()
         var combinedEnv: [String: String] = envSnapshot
 
         if let envFiles = service.env_file {
@@ -1253,7 +1256,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                     network: networkToConnect,
                     aliases: service.networkConfigurations?[network]?.aliases ?? [],
                     serviceName: serviceName,
-                    environmentVariables: environmentVariables
+                    environmentVariables: envSnapshot
                 )
                 runCommandArgs.append(networkTranslation.arg)
                 if let warning = networkTranslation.warning {
@@ -1274,7 +1277,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         let hostnameTranslation = Self.hostnameRunArgs(
             hostname: service.hostname,
             serviceName: serviceName,
-            environmentVariables: environmentVariables
+            environmentVariables: envSnapshot
         )
         if let warning = hostnameTranslation.warning {
             print(warning)
@@ -1306,9 +1309,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             // otherwise an entry fully wrapped in a variable (e.g. "${HOST_ENTRY}"
             // expanding to "foo:host-gateway") is missed and hostGatewayIP is left
             // empty, silently producing "--add-host foo:" (now "foo:" in /etc/hosts).
-            let resolvedEntries = extraHosts.map { resolveVariable($0, with: environmentVariables) }
+            let resolvedEntries = extraHosts.map { resolveVariable($0, with: envSnapshot) }
             let needsGateway = resolvedEntries.contains { $0.hasSuffix(":host-gateway") }
-            let resolvedNetworkName = service.networks?.first.map { resolveVariable($0, with: environmentVariables) } ?? "default"
+            let resolvedNetworkName = service.networks?.first.map { resolveVariable($0, with: envSnapshot) } ?? "default"
             let hostGatewayIP = needsGateway ? Self.resolveHostGatewayIP(networkName: resolvedNetworkName) : ""
 
             var hostsFileLines = ["127.0.0.1 localhost", "::1 localhost"]
@@ -1327,7 +1330,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             // the container that resolves its own hostname still works. Skipped if
             // extra_hosts already defines that name explicitly, so an intentional
             // user override wins.
-            let ownHostname = service.hostname.map { resolveVariable($0, with: environmentVariables) } ?? containerName
+            let ownHostname = service.hostname.map { resolveVariable($0, with: envSnapshot) } ?? containerName
             if !seenHostnames.contains(ownHostname) {
                 hostsFileLines.append("127.0.0.1 \(ownHostname)")
             }
@@ -1343,7 +1346,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
         // Add working directory
         if let workingDir = service.working_dir {
-            let resolvedWorkingDir = resolveVariable(workingDir, with: environmentVariables)
+            let resolvedWorkingDir = resolveVariable(workingDir, with: envSnapshot)
             runCommandArgs.append("--workdir")
             runCommandArgs.append(resolvedWorkingDir)
         }
@@ -1359,12 +1362,12 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
 
         runCommandArgs.append(
-            contentsOf: Self.hardeningRunArgs(for: service, environment: environmentVariables)
+            contentsOf: Self.hardeningRunArgs(for: service, environment: envSnapshot)
         )
         for warning in Self.unsupportedOptionWarnings(
             for: service,
             serviceName: serviceName,
-            environment: environmentVariables
+            environment: envSnapshot
         ) {
             print(warning)
         }
@@ -1382,7 +1385,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         }
         let effectiveMemoryLimit = service.mem_limit ?? service.deploy?.resources?.limits?.memory
         if let memory = effectiveMemoryLimit {
-            let resolved = resolveVariable(memory, with: environmentVariables)
+            let resolved = resolveVariable(memory, with: envSnapshot)
             let (memoryArg, didClamp) = Self.clampMemoryLimit(resolved)
             if didClamp {
                 print("Note: Service '\(serviceName)' mem_limit '\(resolved)' is below Apple Container's 200 MiB minimum; clamping to \(memoryArg).")
