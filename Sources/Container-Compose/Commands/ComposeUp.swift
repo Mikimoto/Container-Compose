@@ -227,16 +227,25 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         // give every container a dotted name (`<svc>.<dnsDomain>`) and pass
         // `--dns-domain` so libc inside the container resolves peers via the
         // daemon's DNS server. If not, fall back to /etc/hosts patching.
-        if let derived = ComposeProject.sanitizeDnsDomain(projectName) {
-            dnsDomain = derived
-            dnsAvailable = await checkDnsDomainRegistered(derived)
+        let globalDomain = await configuredDnsDomain()
+        let derivedDomain = ComposeProject.sanitizeDnsDomain(projectName)
+        var registeredCache: [String: Bool] = [:]
+        for candidate in [globalDomain, derivedDomain].compactMap({ $0 }) where !candidate.isEmpty {
+            registeredCache[candidate] = await checkDnsDomainRegistered(candidate)
+        }
+        if let choice = Self.preferredDnsDomain(
+            global: globalDomain, derived: derivedDomain,
+            isRegistered: { registeredCache[$0] == true })
+        {
+            dnsDomain = choice.domain
+            dnsAvailable = choice.available
             if dnsAvailable {
-                print("Info: DNS domain '\(derived)' is registered. Using real DNS for inter-container resolution.")
+                print("Info: DNS domain '\(choice.domain)' is registered. Using real DNS for inter-container resolution.")
             } else {
                 print("""
-                Note: DNS domain '\(derived)' is not registered. Inter-container hostname
+                Note: DNS domain '\(choice.domain)' is not registered. Inter-container hostname
                       resolution will fall back to /etc/hosts patching. For real DNS:
-                          sudo container system dns create \(derived)
+                          sudo container system dns create \(choice.domain)
                 """)
             }
         }
@@ -852,6 +861,55 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     }
 
 
+    /// Pure parser for the `[dns] domain` entry of `container system property list`.
+    ///
+    /// That output is TOML-shaped sections, so a bare `domain = ...` line only counts
+    /// while the `[dns]` header is the section in force — `[registry]` carries a
+    /// `domain` of its own (`docker.io`), and reading it as the DNS domain would
+    /// register every container under the registry's name.
+    static func dnsDomainProperty(_ output: String) -> String? {
+        var inDNS = false
+        for raw in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            let line = raw.trimmingCharacters(in: .whitespaces)
+            if line.hasPrefix("[") {
+                inDNS = line == "[dns]"
+                continue
+            }
+            guard inDNS, line.hasPrefix("domain") else { continue }
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let value = line[line.index(after: eq)...]
+                .trimmingCharacters(in: .whitespaces)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
+            return value.isEmpty ? nil : value
+        }
+        return nil
+    }
+
+    /// Which DNS domain this project should use, given the globally configured one
+    /// and the one derived from the compose project name.
+    ///
+    /// The global domain wins when it is registered. Deriving from the project name
+    /// alone meant a compose file called `dev-cluster` looked for a `dev-cluster`
+    /// domain, while the operator had followed the documented setup and registered
+    /// something else — so `dnsAvailable` was false, `--dns-domain` was never passed,
+    /// and the DNS readiness barrier silently never ran. Nothing said so: the
+    /// /etc/hosts fallback it dropped to is best-effort by design.
+    ///
+    /// The derived name stays as the second candidate so a project that did register
+    /// its own name keeps working.
+    static func preferredDnsDomain(
+        global: String?, derived: String?, isRegistered: (String) -> Bool
+    ) -> (domain: String, available: Bool)? {
+        for candidate in [global, derived].compactMap({ $0 }) where !candidate.isEmpty {
+            if isRegistered(candidate) { return (candidate, true) }
+        }
+        // Nothing registered: still report a domain so the caller can name it in the
+        // hint it prints, preferring the one the operator actually configured.
+        guard let fallback = [global, derived].compactMap({ $0 }).first(where: { !$0.isEmpty })
+        else { return nil }
+        return (fallback, false)
+    }
+
     /// Pure parser for `container system dns list` output. Output looks like:
     ///     DOMAIN
     ///     foo
@@ -868,6 +926,20 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
 
     /// Checks whether `domain` has been registered via `container system dns create`.
     /// Returns `false` if the CLI is missing, the call fails, or the domain isn't listed.
+    private func configuredDnsDomain() async -> String? {
+        let process = Process()
+        process.launchPath = "/usr/bin/env"
+        process.arguments = ["container", "system", "property", "list"]
+        let stdout = Pipe()
+        process.standardOutput = stdout
+        process.standardError = Pipe()
+        do { try process.run() } catch { return nil }
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else { return nil }
+        let data = stdout.fileHandleForReading.readDataToEndOfFile()
+        return Self.dnsDomainProperty(String(data: data, encoding: .utf8) ?? "")
+    }
+
     private func checkDnsDomainRegistered(_ domain: String) async -> Bool {
         let process = Process()
         process.launchPath = "/usr/bin/env"
