@@ -336,3 +336,41 @@ struct EnvironmentInterpolationTests {
         #expect(ComposeUp.interpolatedEnvironment(["A": "plain"])["A"] == "plain")
     }
 }
+
+/// A container reaching `.running` does not mean its name resolves yet — Apple
+/// Container publishes the DNS record a moment afterwards, where Docker's
+/// embedded DNS updates as the container joins the network. `up` therefore waits
+/// for the record before releasing the wave, and this is the name it waits on.
+@Suite("DNS Registration Name")
+struct DNSRegistrationNameTests {
+
+    @Test("the domain is appended to a plain container name")
+    func plainNameGetsDomain() {
+        #expect(
+            ComposeUp.dnsRegistrationName(containerName: "patroni2", dnsDomain: "dcf")
+                == "patroni2.dcf")
+    }
+
+    /// Without `container_name`, `up` already builds a dotted name itself;
+    /// appending again would wait on `patroni2.dcf.dcf`, which never resolves.
+    @Test("an already-qualified name is left alone")
+    func qualifiedNameUnchanged() {
+        #expect(
+            ComposeUp.dnsRegistrationName(containerName: "patroni2.dcf", dnsDomain: "dcf")
+                == "patroni2.dcf")
+    }
+
+    @Test("a name ending in the domain's letters but not the domain is still qualified")
+    func similarSuffixStillQualified() {
+        #expect(
+            ComposeUp.dnsRegistrationName(containerName: "mydcf", dnsDomain: "dcf")
+                == "mydcf.dcf")
+    }
+
+    @Test("a multi-label domain works the same way")
+    func multiLabelDomain() {
+        #expect(
+            ComposeUp.dnsRegistrationName(containerName: "db", dnsDomain: "test.local")
+                == "db.test.local")
+    }
+}
