@@ -69,9 +69,10 @@ public enum ComposeError: Error, LocalizedError {
         case .noSuchService(let name):
             return "no such service: \(name)"
         case .unsupportedNetworkMode(let service, let mode):
-            return """
-            Service '\(service)' sets network_mode: \(mode), which `container run` cannot express.             Starting it anyway would attach the container to the default network — more connectivity             than the compose file asks for, not less. Remove the key, or run this service under a             runtime that supports it.
-            """
+            return "Service '\(service)' sets network_mode: \(mode), which `container run` "
+                + "cannot express. Starting it anyway would attach the container to the default "
+                + "network — more connectivity than the compose file asks for, not less. Remove "
+                + "the key, or run this service under a runtime that supports it."
         }
     }
 }
