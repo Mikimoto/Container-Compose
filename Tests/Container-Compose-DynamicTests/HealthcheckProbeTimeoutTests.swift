@@ -50,23 +50,43 @@ struct HealthcheckProbeTimeoutTests {
 
         var composeUp = try ComposeUp.parse(["-d", "--cwd", dir.path(percentEncoded: false)])
         try await composeUp.run()
-        defer {
-            Task {
-                var down = try? ComposeDown.parse(["--cwd", dir.path(percentEncoded: false)])
-                try? await down?.run()
-            }
+
+        // Torn down on both paths and awaited. A `defer` cannot hold the async
+        // call, and spawning a detached Task from one leaves the container behind
+        // whenever the test finishes first -- measured.
+        func tearDown() async {
+            var down = try? ComposeDown.parse(["--cwd", dir.path(percentEncoded: false)])
+            try? await down?.run()
+            // `down` stops the container but leaves it listed, so the suite would
+            // accumulate one stopped container per run. Removing it explicitly
+            // keeps repeated runs clean.
+            _ = try? await ComposeUp
+                .parse(["-d", "--cwd", dir.path(percentEncoded: false)])
+                .streamCommand(
+                    "container",
+                    args: ["delete", "-f", "\(name)-victim"],
+                    onStdout: { _ in },
+                    onStderr: { _ in })
+            try? FileManager.default.removeItem(at: dir)
         }
 
         let composeCommand = try ComposeUp.parse(["-d", "--cwd", dir.path(percentEncoded: false)])
         let start = ContinuousClock.now
-        let outcome = try await composeCommand.streamCommand(
-            "container",
-            args: ["exec", "\(name)-victim", "sleep", "\(Self.execSleepSeconds)"],
-            timeout: Self.probeTimeout,
-            onStdout: { _ in },
-            onStderr: { _ in }
-        )
+        let outcome: CommandOutcome
+        do {
+            outcome = try await composeCommand.streamCommand(
+                "container",
+                args: ["exec", "\(name)-victim", "sleep", "\(Self.execSleepSeconds)"],
+                timeout: Self.probeTimeout,
+                onStdout: { _ in },
+                onStderr: { _ in }
+            )
+        } catch {
+            await tearDown()
+            throw error
+        }
         let elapsed = ContinuousClock.now - start
+        await tearDown()
 
         // Without the SIGKILL escalation this call does not return and the test
         // times out rather than failing here.
