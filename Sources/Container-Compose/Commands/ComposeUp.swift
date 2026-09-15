@@ -679,6 +679,37 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     ///   - idleTimeout: Max seconds of no output (while not running) before failing.
     ///   - maxWait: Absolute ceiling on the wait, regardless of ongoing output.
     ///   - interval: How often to poll (in seconds).
+    /// What the wait loop should do next.
+    enum WaitVerdict: Equatable {
+        case keepWaiting
+        case idleTimeout
+        case totalTimeout
+    }
+
+    /// Separates the two waits that share one loop.
+    ///
+    /// Before the container is running, silence is the signal that matters: an
+    /// image pull streams progress, so a gap with nothing coming out and nothing
+    /// running means genuinely stuck rather than merely slow. That is what
+    /// `idleTimeout` is for.
+    ///
+    /// Once it has been seen running, startup is over and the loop is waiting for
+    /// a one-shot's work to finish. Silence there is the normal case — a `chown -R`
+    /// over a large volume prints nothing for minutes — so the idle timeout no
+    /// longer applies. `maxWait` still bounds the whole thing, because an
+    /// unbounded wait is the worse failure.
+    static func waitVerdict(
+        hasStarted: Bool,
+        silentFor: TimeInterval,
+        elapsed: TimeInterval,
+        idleTimeout: TimeInterval,
+        maxWait: TimeInterval
+    ) -> WaitVerdict {
+        if !hasStarted, silentFor > idleTimeout { return .idleTimeout }
+        if elapsed > maxWait { return .totalTimeout }
+        return .keepWaiting
+    }
+
     private func waitUntilServiceStarted(
         _ serviceName: String,
         containerName: String,
@@ -691,6 +722,7 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     ) async throws -> ServiceStartState {
         let client = ContainerClient()
         let start = Date()
+        var hasStarted = false
 
         while true {
             try await Task.sleep(nanoseconds: UInt64(interval * 1_000_000_000))
@@ -702,8 +734,14 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             // certain — with six VMs booting at once a `chown -R` init is still
             // running at the first 0.5s poll, where launched one at a time it
             // had almost always already exited.
-            if container?.status == .running, !awaitCompletion {
-                return .running
+            if container?.status == .running {
+                if !awaitCompletion {
+                    return .running
+                }
+                // Startup is over. What follows is a different wait — for the
+                // one-shot's work to finish — and it must not be judged by the
+                // startup budget.
+                hasStarted = true
             }
             if container?.status == .stopped {
                 if let foregroundRun {
@@ -734,23 +772,29 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 }
             }
             let now = Date()
-            // An active pull keeps refreshing `activity`, pushing the idle
-            // deadline out, so slow downloads never trip this — only genuine
-            // silence does.
-            if now.timeIntervalSince(activity.lastActivity) > idleTimeout {
+            switch Self.waitVerdict(
+                hasStarted: hasStarted,
+                silentFor: now.timeIntervalSince(activity.lastActivity),
+                elapsed: now.timeIntervalSince(start),
+                idleTimeout: idleTimeout,
+                maxWait: maxWait
+            ) {
+            case .keepWaiting:
+                break
+            case .idleTimeout:
                 throw NSError(
                     domain: "ContainerWait", code: 1,
                     userInfo: [
                         NSLocalizedDescriptionKey: "Timed out waiting for container '\(containerName)' to be running."
                     ])
-            }
-            // Absolute backstop: even with continuous output, never wait past
-            // `maxWait` for the container to come up.
-            if now.timeIntervalSince(start) > maxWait {
+            case .totalTimeout:
+                let what = hasStarted
+                    ? "to finish (it started, then ran for over \(Int(maxWait))s)"
+                    : "to be running (exceeded \(Int(maxWait))s)"
                 throw NSError(
                     domain: "ContainerWait", code: 1,
                     userInfo: [
-                        NSLocalizedDescriptionKey: "Timed out waiting for container '\(containerName)' to be running (exceeded \(Int(maxWait))s)."
+                        NSLocalizedDescriptionKey: "Timed out waiting for container '\(containerName)' \(what)."
                     ])
             }
         }
@@ -763,13 +807,26 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             ])
     }
 
-    private static func waitForInitExitCode(containerName: String) async throws -> Int32 {
+    /// How long a one-shot is allowed to run before its completion wait gives up.
+    ///
+    /// `containerWait` answers when the container exits, so this response timeout
+    /// is the one-shot's whole runtime budget, not a request budget. At ten
+    /// seconds any init doing real work — a `chown -R` over a populated volume,
+    /// a schema load — failed with an XPC timeout that named neither the service
+    /// nor what it had been waiting for. It matches the wait loop's `maxWait` so
+    /// there is one number bounding "how long may a one-shot take".
+    static let oneShotCompletionTimeout: TimeInterval = 300
+
+    private static func waitForInitExitCode(
+        containerName: String,
+        timeout: TimeInterval = ComposeUp.oneShotCompletionTimeout
+    ) async throws -> Int32 {
         let request = XPCMessage(route: .containerWait)
         request.set(key: .id, value: containerName)
         request.set(key: .processIdentifier, value: containerName)
 
         let client = XPCClient(service: "com.apple.container.apiserver")
-        let response = try await client.send(request, responseTimeout: .seconds(10))
+        let response = try await client.send(request, responseTimeout: .seconds(Int(timeout)))
         return Int32(response.int64(key: .exitCode))
     }
 
