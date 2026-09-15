@@ -1161,14 +1161,14 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             print("\nStarting service: \(serviceName)")
             print("Starting \(serviceName)")
             print("----------------------------------------\n")
-            let exitCode = try await streamCommand(
+            let outcome = try await streamCommand(
                 "container",
                 args: ["run"] + runCommandArgs,
                 onStdout: handleOutput,
                 onStderr: handleOutput
             )
-            guard exitCode == 0 else {
-                throw ComposeError.containerRunFailed(serviceName, exitCode)
+            guard outcome.status == 0 else {
+                throw ComposeError.containerRunFailed(serviceName, outcome.status)
             }
             let detachedContainerName = containerName
             await ServiceExitCodeRegistry.shared.set(Task {
@@ -1188,15 +1188,15 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 print("Starting \(serviceName)")
                 print("----------------------------------------\n")
                 do {
-                    let exitCode = try await streamCommand(
+                    let outcome = try await streamCommand(
                         "container",
                         args: ["run"] + runCommandArgs,
                         onStdout: handleOutput,
                         onStderr: handleOutput
                     )
-                    await runHandle.complete(exitCode)
-                    if exitCode != 0 {
-                        fputs("Error: Service '\(serviceName)' exited with status \(exitCode).\n", stderr)
+                    await runHandle.complete(outcome.status)
+                    if outcome.status != 0 {
+                        fputs("Error: Service '\(serviceName)' exited with status \(outcome.status).\n", stderr)
                     }
                 } catch {
                     await runHandle.complete(-1)
@@ -1262,33 +1262,59 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
                 timeout: timeout,
                 onStdout: { _ in },
                 onStderr: { _ in }
-            ) == 0
+            ).succeeded
         }
 
-        // Compose `start_period` is a grace window, not a delay: probes run
-        // during it and their failures do not consume the retry budget, and the
-        // first success ends the wait immediately.
+        let healthy = try await Self.awaitHealthy(
+            retries: retries,
+            interval: interval,
+            startPeriod: startPeriod,
+            probe: probeSucceeded,
+            sleep: { try await Task.sleep(for: .seconds($0)) })
+        if !healthy {
+            throw ComposeError.healthcheckFailed(serviceName)
+        }
+    }
+
+    /// The Compose healthcheck waiting policy, with the probe and the clock
+    /// injected so the policy can be exercised without a daemon.
+    ///
+    /// `start_period` is a grace window, not a delay: probes run during it, the
+    /// first success ends the wait immediately, and failures inside it do not
+    /// consume the retry budget. Only once the window has elapsed does each
+    /// failure count against `retries`.
+    ///
+    /// The window is wall clock, so a slow probe consumes it exactly as it does in
+    /// production; `now` is injected only so a test can drive that clock instead
+    /// of waiting out the real one.
+    static func awaitHealthy(
+        retries: Int,
+        interval: TimeInterval,
+        startPeriod: TimeInterval,
+        probe: () async throws -> Bool,
+        sleep: (TimeInterval) async throws -> Void,
+        now: () -> TimeInterval = { Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000 }
+    ) async throws -> Bool {
         if startPeriod > 0 {
-            let deadline = ContinuousClock.now.advanced(by: .seconds(startPeriod))
-            while ContinuousClock.now < deadline {
-                if try await probeSucceeded() {
-                    return
+            let deadline = now() + startPeriod
+            while now() < deadline {
+                if try await probe() {
+                    return true
                 }
-                try await Task.sleep(for: .seconds(interval))
+                try await sleep(interval)
             }
         }
 
-        for attempt in 1...retries {
-            if try await probeSucceeded() {
-                return
+        for attempt in 1...max(retries, 1) {
+            if try await probe() {
+                return true
             }
-
-            if attempt < retries {
-                try await Task.sleep(for: .seconds(interval))
+            if attempt < max(retries, 1) {
+                try await sleep(interval)
             }
         }
 
-        throw ComposeError.healthcheckFailed(serviceName)
+        return false
     }
 
     private func pullImage(_ imageName: String, platform: String?) async throws {
@@ -1498,8 +1524,9 @@ extension ComposeUp {
         timeout: TimeInterval? = nil,
         onStdout: @escaping (@Sendable (String) -> Void),
         onStderr: @escaping (@Sendable (String) -> Void)
-    ) async throws -> Int32 {
-        try await withCheckedThrowingContinuation { continuation in
+    ) async throws -> CommandOutcome {
+        let timedOut = TimeoutFlag()
+        return try await withCheckedThrowingContinuation { continuation in
             let process = Process()
             let stdoutPipe = Pipe()
             let stderrPipe = Pipe()
@@ -1536,7 +1563,8 @@ extension ComposeUp {
             process.terminationHandler = { proc in
                 stdoutHandle.readabilityHandler = nil
                 stderrHandle.readabilityHandler = nil
-                continuation.resume(returning: proc.terminationStatus)
+                continuation.resume(
+                    returning: CommandOutcome(status: proc.terminationStatus, timedOut: timedOut.isSet))
             }
 
             do {
@@ -1548,6 +1576,10 @@ extension ComposeUp {
                     // caller sees a normal failure.
                     DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { [weak process] in
                         guard let process, process.isRunning else { return }
+                        // Recorded before the signal: a probe that traps the
+                        // signal and exits 0 would otherwise be indistinguishable
+                        // from one that genuinely passed.
+                        timedOut.set()
                         process.terminate()
                         // `container exec` ignores SIGTERM while the process it
                         // is proxying is stuck — measured: a probe that hangs
