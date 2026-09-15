@@ -104,11 +104,15 @@ struct HardeningComposeIntegrationTests {
         #expect(args.contains("--init"))
     }
 
-    @Test("network_mode produces a warning and no run args")
+    /// The document's `fixer` service carries `network_mode: none`, which is
+    /// rejected rather than reported: no run args, no note, and the value comes
+    /// back from the rejection seam so the caller can refuse to start it.
+    @Test("network_mode: none through the document is rejected, not warned about")
     func networkModeThroughDocument() throws {
         let svc = try service("fixer")
         #expect(ComposeUp.hardeningRunArgs(for: svc).contains("--network") == false)
+        #expect(ComposeUp.rejectedNetworkMode(svc.network_mode) == "none")
         #expect(ComposeUp.unsupportedOptionWarnings(for: svc, serviceName: "fixer")
-            .contains { $0.contains("network_mode") })
+            .contains { $0.contains("network_mode") } == false)
     }
 }

@@ -146,10 +146,16 @@ struct HardeningArgsTests {
         #expect(ComposeUp.hardeningRunArgs(for: svc).isEmpty)
     }
 
-    @Test("network_mode is reported as unsupported")
+    /// `none` is fatal rather than reported, so it must NOT also produce a note —
+    /// the throw is the whole report. An unsupported-but-survivable mode still does.
+    @Test("an unsupported network_mode is reported, but none is not")
     func networkModeIsReported() throws {
-        let svc = Service(image: "alpine", network_mode: "none")
-        let warnings = ComposeUp.unsupportedOptionWarnings(for: svc, serviceName: "etcd-init")
+        let fatal = Service(image: "alpine", network_mode: "none")
+        #expect(ComposeUp.unsupportedOptionWarnings(for: fatal, serviceName: "etcd-init")
+            .contains { $0.contains("network_mode") } == false)
+
+        let reported = Service(image: "alpine", network_mode: "host")
+        let warnings = ComposeUp.unsupportedOptionWarnings(for: reported, serviceName: "etcd-init")
         #expect(warnings.contains { $0.contains("network_mode") && $0.contains("etcd-init") })
     }
 
