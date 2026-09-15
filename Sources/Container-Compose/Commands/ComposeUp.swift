@@ -572,13 +572,31 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
             }
         }
 
-        if let mode = service.network_mode {
+        // `none` is rejected outright rather than warned about, so it is absent
+        // here; every other value still only produces a note.
+        if let mode = service.network_mode, Self.rejectedNetworkMode(mode) == nil {
             warnings.append(
                 "Note: Service '\(serviceName)' sets network_mode: \(mode). `container run` has no equivalent; the container will join the default network."
             )
         }
 
         return warnings
+    }
+
+    /// The `network_mode` values that must stop the run instead of being reported.
+    ///
+    /// Only `none` qualifies. Every unsupported mode is wrong, but the rest fail
+    /// as "does not behave as configured" — the container gets the default network
+    /// where the file asked for the host's, or for a peer's. `none` fails in the
+    /// other direction: the file asks for no networking at all and the container
+    /// would come up connected, which is less isolation than was requested and is
+    /// not something to discover from a note in the log.
+    ///
+    /// Returns the normalised mode when it must be rejected, `nil` otherwise.
+    static func rejectedNetworkMode(_ mode: String?) -> String? {
+        guard let normalised = mode?.trimmingCharacters(in: .whitespaces).lowercased(),
+              !normalised.isEmpty else { return nil }
+        return normalised == "none" ? normalised : nil
     }
 
     static func validateStoppedServiceExitCode(_ exitCode: Int32, serviceName: String) throws {
@@ -1168,6 +1186,9 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
         runCommandArgs.append(
             contentsOf: Self.hardeningRunArgs(for: service, environment: environmentVariables)
         )
+        if let rejected = Self.rejectedNetworkMode(service.network_mode) {
+            throw ComposeError.unsupportedNetworkMode(serviceName, rejected)
+        }
         for warning in Self.unsupportedOptionWarnings(
             for: service,
             serviceName: serviceName,

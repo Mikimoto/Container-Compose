@@ -233,3 +233,54 @@ struct HardeningArgsTests {
         #expect(ComposeUp.hardeningRunArgs(for: svc).isEmpty)
     }
 }
+
+/// `network_mode` is parsed so it can be acted on. `none` stops the run; every
+/// other unsupported value is only reported, because those fail as "not what was
+/// configured" while `none` fails as "less isolated than was configured".
+@Suite("Network Mode Rejection")
+struct NetworkModeRejectionTests {
+
+    @Test("none is rejected")
+    func noneIsRejected() {
+        #expect(ComposeUp.rejectedNetworkMode("none") == "none")
+    }
+
+    @Test("case and surrounding whitespace do not let none through")
+    func noneIsNormalised() {
+        #expect(ComposeUp.rejectedNetworkMode("None") == "none")
+        #expect(ComposeUp.rejectedNetworkMode("  NONE  ") == "none")
+    }
+
+    /// These are wrong too, but they are reported rather than fatal — widening
+    /// the rejection is a behaviour change for existing compose files.
+    @Test("other unsupported modes are not rejected")
+    func othersAreNotRejected() {
+        for mode in ["host", "bridge", "service:db", "container:abc123", "default"] {
+            #expect(ComposeUp.rejectedNetworkMode(mode) == nil, "\(mode) should not be fatal")
+        }
+    }
+
+    @Test("an absent or empty network_mode is not rejected")
+    func absentIsNotRejected() {
+        #expect(ComposeUp.rejectedNetworkMode(nil) == nil)
+        #expect(ComposeUp.rejectedNetworkMode("") == nil)
+        #expect(ComposeUp.rejectedNetworkMode("   ") == nil)
+    }
+
+    /// The note must not also fire for `none`; the throw is the whole report.
+    @Test("none produces no warning, since it is fatal instead")
+    func noneProducesNoWarning() {
+        let service = Service(image: "alpine:latest", network_mode: "none")
+        let warnings = ComposeUp.unsupportedOptionWarnings(
+            for: service, serviceName: "svc", environment: [:])
+        #expect(!warnings.contains { $0.contains("network_mode") })
+    }
+
+    @Test("an unsupported but non-fatal mode still produces its note")
+    func hostStillWarns() {
+        let service = Service(image: "alpine:latest", network_mode: "host")
+        let warnings = ComposeUp.unsupportedOptionWarnings(
+            for: service, serviceName: "svc", environment: [:])
+        #expect(warnings.contains { $0.contains("network_mode: host") })
+    }
+}
