@@ -98,3 +98,60 @@ struct CPULimitClampTests {
         #expect(ComposeUp.builderCPUCount(for: svc) == 4)
     }
 }
+
+/// `Int(Double)` traps instead of saturating, so every value that reaches the
+/// conversion has to be range-checked first. Each case below crashed the process
+/// before that check existed.
+@Suite("CPU Limit Range Validation")
+struct CPULimitRangeValidationTests {
+
+    @Test("an infinite cpus value is passed through rather than crashing")
+    func infiniteIsPassedThrough() {
+        let (value, clamped) = ComposeUp.clampCPULimit("1e400")
+        #expect(value == "1e400")
+        #expect(!clamped)
+    }
+
+    @Test("a NaN cpus value is passed through rather than crashing")
+    func nanIsPassedThrough() {
+        let (value, clamped) = ComposeUp.clampCPULimit("nan")
+        #expect(value == "nan")
+        #expect(!clamped)
+    }
+
+    /// Finite, but larger than `Int` can hold — the case `isFinite` alone misses.
+    @Test("a finite value beyond Int's range is passed through rather than crashing")
+    func beyondIntRangeIsPassedThrough() {
+        let (value, clamped) = ComposeUp.clampCPULimit("1e20")
+        #expect(value == "1e20")
+        #expect(!clamped)
+    }
+
+    @Test("a non-numeric cpus value is still passed through")
+    func nonNumericIsPassedThrough() {
+        let (value, clamped) = ComposeUp.clampCPULimit("plenty")
+        #expect(value == "plenty")
+        #expect(!clamped)
+    }
+
+    /// The ordinary path is unchanged by the guard.
+    @Test("ordinary fractions still round up, whole numbers are left alone")
+    func ordinaryValuesUnchanged() {
+        #expect(ComposeUp.clampCPULimit("0.5") == ("1", true))
+        #expect(ComposeUp.clampCPULimit("2.5") == ("3", true))
+        #expect(ComposeUp.clampCPULimit("4") == ("4", false))
+    }
+
+    /// The builder default survives a value the clamp refuses to touch.
+    @Test("the builder falls back to its default for an unrepresentable value")
+    func builderFallsBack() throws {
+        let svc = try YAMLDecoder().decode(Service.self, from: """
+        image: alpine
+        deploy:
+          resources:
+            limits:
+              cpus: "1e400"
+        """)
+        #expect(ComposeUp.builderCPUCount(for: svc) == 2)
+    }
+}

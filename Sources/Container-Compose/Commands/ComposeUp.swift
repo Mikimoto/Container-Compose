@@ -499,9 +499,17 @@ public struct ComposeUp: AsyncParsableCommand, @unchecked Sendable {
     /// expressible limit rather than down: 0.5 would otherwise become 0, which
     /// container rejects, and a slightly loose cap fails less destructively than
     /// none at all. Callers report the change, as with the memory floor.
+    /// `Int(Double)` traps rather than saturating, so the range is checked before
+    /// the conversion: `cpus: 1e400` parses as infinity, `cpus: nan` as NaN, and
+    /// `cpus: 1e20` is finite but larger than `Int` can hold. All three crashed
+    /// here. A value this tool cannot express is passed through untouched so the
+    /// runtime rejects it by name, which is a better outcome than a fatal error
+    /// with no service in it.
     static func clampCPULimit(_ value: String) -> (value: String, clamped: Bool) {
-        guard let cpus = Double(value) else { return (value, false) }
-        let whole = max(1, Int(cpus.rounded(.up)))
+        guard let cpus = Double(value), cpus.isFinite else { return (value, false) }
+        let rounded = cpus.rounded(.up)
+        guard rounded >= Double(Int.min), rounded <= Double(Int.max) else { return (value, false) }
+        let whole = max(1, Int(rounded))
         guard Double(whole) != cpus else { return (value, false) }
         return (String(whole), true)
     }
